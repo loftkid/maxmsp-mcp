@@ -23,7 +23,6 @@ for obj_list in docs.values():
     for obj in obj_list:
         flattened_docs[obj["name"]] = obj
 
-io_server_started = False
 
 
 class MaxMSPConnection:
@@ -43,13 +42,28 @@ class MaxMSPConnection:
             if fut and not fut.done():
                 fut.set_result(data.get("results"))
 
+    async def ensure_connected(self):
+        """Connect (or reconnect) to the bridge in Max, so Max can be opened after the MCP server."""
+        if self.sio.connected:
+            return
+        full_url = f"{self.server_url}:{self.server_port}"
+        try:
+            await self.sio.connect(full_url, namespaces=self.namespace, wait_timeout=3)
+        except Exception as e:
+            raise ConnectionError(
+                f"Max bridge not reachable at {full_url}. Open the agent patch in Max and click 'script start'. ({e})"
+            )
+        logging.info(f"Connected to Socket.IO server at {full_url}")
+
     async def send_command(self, cmd: dict):
         """Send a command to MaxMSP."""
+        await self.ensure_connected()
         await self.sio.emit("command", cmd, namespace=self.namespace)
         logging.info(f"Sent to MaxMSP: {cmd}")
 
     async def send_request(self, payload: dict, timeout=2.0):
         """Send a fetch request to MaxMSP."""
+        await self.ensure_connected()
         request_id = str(uuid.uuid4())
         future = asyncio.get_event_loop().create_future()
         self._pending[request_id] = future
@@ -84,32 +98,18 @@ class MaxMSPConnection:
 @asynccontextmanager
 async def server_lifespan(server: FastMCP):
     """Manage server lifespan"""
-    global io_server_started
-    if not io_server_started:
-        try:
-            maxmsp = MaxMSPConnection(
-                SOCKETIO_SERVER_URL, SOCKETIO_SERVER_PORT, NAMESPACE
-            )
-            try:
-                # Start the Socket.IO server
-                await maxmsp.start_server()
-                io_server_started = True
-                logging.info(f"Listening on {maxmsp.server_url}:{maxmsp.server_port}")
-
-                # Yield the Socket.IO connection to make it available in the lifespan context
-                yield {"maxmsp": maxmsp}
-            except Exception as e:
-                logging.error(f"lifespan error starting server: {e}")
-                await maxmsp.sio.disconnect()
-                raise
-
-        finally:
-            logging.info("Shutting down connection")
+    # max may not be open yet: try once, then connect lazily on the first tool call
+    maxmsp = MaxMSPConnection(SOCKETIO_SERVER_URL, SOCKETIO_SERVER_PORT, NAMESPACE)
+    try:
+        await maxmsp.ensure_connected()
+    except ConnectionError as e:
+        logging.warning(str(e))
+    try:
+        yield {"maxmsp": maxmsp}
+    finally:
+        logging.info("Shutting down connection")
+        if maxmsp.sio.connected:
             await maxmsp.sio.disconnect()
-    else:
-        logging.info(
-            f"IO server already running on {maxmsp.server_url}:{maxmsp.server_port}"
-        )
 
 
 # Create the MCP server with lifespan support
